@@ -1,12 +1,14 @@
-# Disables file download quarantining
+# Disables file download quarantining (except internet zone identifier marking on Windows)
+# Keeps the "mark-of-the-web" / internet zone identifier functionality while removing virus/security checks
 
 --- a/components/download/internal/common/base_file.cc
 +++ b/components/download/internal/common/base_file.cc
-@@ -26,7 +26,6 @@
+@@ -26,7 +26,7 @@
  #include "components/download/public/common/download_interrupt_reasons_utils.h"
  #include "components/download/public/common/download_item.h"
  #include "components/download/public/common/download_stats.h"
 -#include "components/services/quarantine/quarantine.h"
++#include "components/services/quarantine/quarantine.h" // Kept for internet zone identifier
  #include "crypto/hash.h"
  #include "crypto/secure_hash.h"
  
@@ -84,83 +86,52 @@
 -    return referrer_url;
 -
 -  return GURL();
--}
--
--void BaseFile::OnFileQuarantined(
--    quarantine::mojom::QuarantineFileResult result) {
--  DCHECK(on_annotation_done_callback_);
--  quarantine_service_.reset();
--  std::move(on_annotation_done_callback_)
--      .Run(QuarantineFileResultToReason(result));
--}
--
--void BaseFile::OnQuarantineServiceError(const GURL& source_url,
--                                        const GURL& referrer_url) {
--#if BUILDFLAG(IS_WIN)
--  OnFileQuarantined(quarantine::SetInternetZoneIdentifierDirectly(
--      full_path_, source_url, referrer_url));
--#else   // !BUILDFLAG(IS_WIN)
--  NOTREACHED() << "In-process quarantine service should not have failed.";
--#endif  // !BUILDFLAG(IS_WIN)
  }
  
  void BaseFile::AnnotateWithSourceInformation(
-@@ -640,32 +555,8 @@ void BaseFile::AnnotateWithSourceInforma
+@@ -640,11 +555,15 @@ void BaseFile::AnnotateWithSourceInforma
      const std::optional<url::Origin>& request_initiator,
      mojo::PendingRemote<quarantine::mojom::Quarantine> remote_quarantine,
      OnAnnotationDoneCallback on_annotation_done_callback) {
++  // Only apply internet zone identifier marking on Windows, skip security checks
+ #if BUILDFLAG(IS_WIN)
 -  GURL authority_url = GetEffectiveAuthorityURL(source_url, referrer_url);
--  if (!remote_quarantine) {
--#if BUILDFLAG(IS_WIN)
--    quarantine::mojom::QuarantineFileResult result =
--        quarantine::SetInternetZoneIdentifierDirectly(full_path_, authority_url,
--                                                      referrer_url);
++  quarantine::SetInternetZoneIdentifierDirectly(full_path_, source_url,
++                                                referrer_url);
++#endif
++  // Skip quarantine service and security checks
+   std::move(on_annotation_done_callback)
+       .Run(DOWNLOAD_INTERRUPT_REASON_NONE);
 -#else
--    quarantine::mojom::QuarantineFileResult result =
--        quarantine::mojom::QuarantineFileResult::ANNOTATION_FAILED;
+-  std::move(on_annotation_done_callback)
+-      .Run(DOWNLOAD_INTERRUPT_REASON_NONE);
 -#endif
--    std::move(on_annotation_done_callback)
--        .Run(QuarantineFileResultToReason(result));
--  } else {
--    quarantine_service_.Bind(std::move(remote_quarantine));
--
--    on_annotation_done_callback_ = std::move(on_annotation_done_callback);
--
--    quarantine_service_.set_disconnect_handler(base::BindOnce(
--        &BaseFile::OnQuarantineServiceError, weak_factory_.GetWeakPtr(),
--        authority_url, referrer_url));
--
--    quarantine_service_->QuarantineFile(
--        full_path_, authority_url, referrer_url, request_initiator, client_guid,
--        base::BindOnce(&BaseFile::OnFileQuarantined,
--                       weak_factory_.GetWeakPtr()));
--  }
-+  std::move(on_annotation_done_callback)
-+      .Run(DOWNLOAD_INTERRUPT_REASON_NONE);
  }
  
  }  // namespace download
 --- a/content/browser/BUILD.gn
 +++ b/content/browser/BUILD.gn
-@@ -156,7 +156,6 @@ source_set("browser") {
+@@ -156,7 +156,7 @@ source_set("browser") {
      "//components/power_monitor",
      "//components/schema_org/common:mojom",
      "//components/services/filesystem:lib",
 -    "//components/services/quarantine",
++    # "//components/services/quarantine", # Kept for internet zone identifier on Windows
      "//components/services/storage",
      "//components/services/storage:filesystem_proxy_factory",
      "//components/services/storage/dom_storage/leveldb:local_storage_proto",
 --- a/content/browser/file_system_access/file_system_access_safe_move_helper.cc
 +++ b/content/browser/file_system_access/file_system_access_safe_move_helper.cc
-@@ -15,7 +15,6 @@
+@@ -15,7 +15,7 @@
  #include "base/thread_annotations.h"
  #include "base/types/expected.h"
  #include "build/build_config.h"
 -#include "components/services/quarantine/quarantine.h"
++#include "components/services/quarantine/quarantine.h" // Kept for internet zone identifier
  #include "content/browser/file_system_access/features.h"
  #include "content/browser/file_system_access/file_system_access_error.h"
  #include "content/public/browser/content_browser_client.h"
-@@ -237,22 +236,9 @@ void FileSystemAccessSafeMoveHelper::Did
+@@ -237,22 +236,13 @@ void FileSystemAccessSafeMoveHelper::Did
    // not exist anymore. In case of error, the source file URL will point to a
    // valid filesystem location.
    base::OnceCallback<void(base::File::Error)> result_callback;
@@ -176,6 +147,12 @@
 -                       weak_factory_.GetWeakPtr(), dest_url(), referrer_url,
 -                       std::move(quarantine_remote));
 -  } else {
++  
++#if BUILDFLAG(IS_WIN)
++  // Mark file with internet zone identifier only on Windows
++  quarantine::SetInternetZoneIdentifierDirectly(
++      dest_url().path(), context_.url, GURL());
++#endif
      result_callback =
          base::BindOnce(&FileSystemAccessSafeMoveHelper::DidFileSkipQuarantine,
                         weak_factory_.GetWeakPtr());
@@ -183,15 +160,15 @@
    manager_->DoFileSystemOperation(
        FROM_HERE, &storage::FileSystemOperationRunner::Move,
        std::move(result_callback), source_url(), dest_url(), options_,
-@@ -269,7 +255,6 @@ void FileSystemAccessSafeMoveHelper::Did
+@@ -269,7 +259,6 @@ void FileSystemAccessSafeMoveHelper::Did
  void FileSystemAccessSafeMoveHelper::DidFileDoQuarantine(
-     const storage::FileSystemURL& target_url,
-     const GURL& referrer_url,
+      const storage::FileSystemURL& target_url,
+      const GURL& referrer_url,
 -    mojo::Remote<quarantine::mojom::Quarantine> quarantine_remote,
-     base::File::Error result) {
+      base::File::Error result) {
    DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
  
-@@ -300,40 +285,9 @@ void FileSystemAccessSafeMoveHelper::Did
+@@ -300,40 +289,9 @@ void FileSystemAccessSafeMoveHelper::Did
        referrer_url.is_valid() && referrer_url.SchemeIsHTTPOrHTTPS()
            ? referrer_url
            : GURL();
